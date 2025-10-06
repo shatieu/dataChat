@@ -1316,15 +1316,66 @@ def main():
             transform: translateY(-2px);
         }
         
-        /* Select Box */
+        /* Select Box - Force dark background and light text */
         [data-baseweb="select"] {
-            background: rgba(15, 23, 42, 0.8) !important;
-            border: 1px solid rgba(59, 130, 246, 0.3) !important;
+            background: #1a1f3a !important;
+            border: 1px solid rgba(59, 130, 246, 0.5) !important;
             border-radius: 8px !important;
         }
         
         [data-baseweb="select"] > div {
-            color: #e8f1ff !important;
+            color: #ffffff !important;
+            background: #1a1f3a !important;
+        }
+        
+        /* Selectbox container */
+        .stSelectbox > div > div {
+            background: #1a1f3a !important;
+        }
+        
+        .stSelectbox label {
+            color: #cbd5e1 !important;
+            font-weight: 500 !important;
+        }
+        
+        /* Selected value in selectbox - bright white text */
+        .stSelectbox [data-baseweb="select"] > div:first-child {
+            color: #ffffff !important;
+            background: #1a1f3a !important;
+            font-weight: 500 !important;
+        }
+        
+        /* All divs within select */
+        .stSelectbox [data-baseweb="select"] div {
+            color: #ffffff !important;
+        }
+        
+        /* Input/Select element itself */
+        .stSelectbox select,
+        .stSelectbox input {
+            color: #ffffff !important;
+            background: #1a1f3a !important;
+        }
+        
+        /* Dropdown menu items */
+        [role="listbox"] {
+            background: #1a1f3a !important;
+            border: 1px solid rgba(59, 130, 246, 0.3) !important;
+        }
+        
+        [role="option"] {
+            color: #ffffff !important;
+            background: #1a1f3a !important;
+        }
+        
+        [role="option"]:hover {
+            background: rgba(59, 130, 246, 0.3) !important;
+            color: #ffffff !important;
+        }
+        
+        /* Arrow icon in select */
+        .stSelectbox svg {
+            fill: #ffffff !important;
         }
         
         /* Labels and Text */

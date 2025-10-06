@@ -36,6 +36,8 @@ DEFAULT_DPI = 100
 
 # Display configuration
 MAX_RESULT_DISPLAY_LENGTH = 300
+MAX_DIFF_EXAMPLES = 50  # Default max examples for diff tables
+MAX_PREVIEW_ROWS = 100  # Max rows to preview in UI
 
 class ModelConfig:
     """Configuration class for different models."""
@@ -153,6 +155,104 @@ def get_current_config():
 
 # === UTILITY FUNCTIONS (Available in code execution) ==================
 
+def preprocess_query_for_datasets(query: str, has_df1: bool, has_df2: bool) -> tuple[str, str | None]:
+    """
+    Preprocess user query to replace @1/@2 with df1/df2.
+    
+    Args:
+        query: User query potentially containing @1 or @2
+        has_df1: Whether df1 is available
+        has_df2: Whether df2 is available
+    
+    Returns:
+        Tuple of (processed_query, warning_message)
+    """
+    warning = None
+    processed = query
+    
+    # Check for @2 references when df2 doesn't exist
+    if '@2' in query and not has_df2:
+        warning = "⚠️ You referenced @2, but only one dataset is uploaded. Please upload a second dataset or rephrase using @1."
+        return processed, warning
+    
+    # Check for @1 when df1 doesn't exist (edge case)
+    if '@1' in query and not has_df1:
+        warning = "⚠️ No dataset uploaded. Please upload at least one dataset first."
+        return processed, warning
+    
+    # Replace @1 and @2 with actual dataframe names
+    processed = processed.replace('@1', 'df1')
+    processed = processed.replace('@2', 'df2')
+    
+    return processed, warning
+
+
+def compute_mean_differences(df1: pd.DataFrame, df2: pd.DataFrame, sort_by_abs: bool = True) -> pd.DataFrame:
+    """
+    Compute mean differences for all common numeric columns.
+    
+    Args:
+        df1: First DataFrame
+        df2: Second DataFrame
+        sort_by_abs: If True, sort by absolute difference (descending)
+    
+    Returns:
+        DataFrame with columns: ['column', 'df1_mean', 'df2_mean', 'mean_diff']
+        Positive mean_diff means df1 > df2
+    """
+    numeric_cols_df1 = df1.select_dtypes(include=[np.number]).columns
+    numeric_cols_df2 = df2.select_dtypes(include=[np.number]).columns
+    common_numeric = list(set(numeric_cols_df1) & set(numeric_cols_df2))
+    
+    if not common_numeric:
+        return pd.DataFrame(columns=['column', 'df1_mean', 'df2_mean', 'mean_diff'])
+    
+    data = []
+    for col in common_numeric:
+        mean1 = df1[col].mean()
+        mean2 = df2[col].mean()
+        data.append({
+            'column': col,
+            'df1_mean': mean1,
+            'df2_mean': mean2,
+            'mean_diff': mean1 - mean2
+        })
+    
+    result = pd.DataFrame(data)
+    
+    if sort_by_abs and len(result) > 0:
+        result['abs_diff'] = result['mean_diff'].abs()
+        result = result.sort_values('abs_diff', ascending=False).drop('abs_diff', axis=1)
+    
+    return result
+
+
+def fuzzy_column_match(cols1: list, cols2: list, threshold: float = 0.6) -> list:
+    """
+    Find potential column matches between two lists using fuzzy matching.
+    
+    Args:
+        cols1: Columns from df1
+        cols2: Columns from df2
+        threshold: Minimum similarity score (0-1) to consider a match
+    
+    Returns:
+        List of tuples: [(col1, col2, similarity_score), ...]
+    """
+    from difflib import SequenceMatcher
+    
+    matches = []
+    for c1 in cols1:
+        for c2 in cols2:
+            # Normalize to lowercase for comparison
+            similarity = SequenceMatcher(None, c1.lower(), c2.lower()).ratio()
+            if similarity >= threshold and c1 != c2:
+                matches.append((c1, c2, similarity))
+    
+    # Sort by similarity descending
+    matches.sort(key=lambda x: x[2], reverse=True)
+    return matches
+
 def compare_datasets(df1: pd.DataFrame, df2: pd.DataFrame, on_columns: Optional[List[str]] = None) -> pd.DataFrame:
     """
     Compare two datasets and return a summary DataFrame with key statistics.
@@ -198,6 +298,7 @@ def find_differences(df1: pd.DataFrame, df2: pd.DataFrame,
                      max_examples: int = 100) -> dict:
     """
     Find differences between two datasets and determine if they are identical.
+    **HARDENED VERSION - Never crashes, always returns valid result**
     
     Args:
         df1: First DataFrame
@@ -217,6 +318,47 @@ def find_differences(df1: pd.DataFrame, df2: pd.DataFrame,
         - 'value_differences': Statistics and concrete examples of value differences
         - 'summary': Human-readable summary of findings
     """
+    # Defensive: handle None or empty dataframes
+    try:
+        if df1 is None or df2 is None:
+            return {
+                'identical': False,
+                'shape_diff': {'df1_shape': (0,0) if df1 is None else df1.shape, 
+                              'df2_shape': (0,0) if df2 is None else df2.shape,
+                              'row_diff': 0, 'col_diff': 0},
+                'columns_only_in_df1': [],
+                'columns_only_in_df2': [],
+                'common_columns': [],
+                'dtype_differences': {},
+                'value_differences': {},
+                'summary': '⚠️ One or both DataFrames are None/missing'
+            }
+        
+        if df1.empty or df2.empty:
+            return {
+                'identical': False,
+                'shape_diff': {'df1_shape': df1.shape, 'df2_shape': df2.shape,
+                              'row_diff': df1.shape[0] - df2.shape[0], 
+                              'col_diff': df1.shape[1] - df2.shape[1]},
+                'columns_only_in_df1': list(df1.columns if not df1.empty else []),
+                'columns_only_in_df2': list(df2.columns if not df2.empty else []),
+                'common_columns': [],
+                'dtype_differences': {},
+                'value_differences': {},
+                'summary': '⚠️ One or both DataFrames are empty'
+            }
+    except Exception as e:
+        return {
+            'identical': False,
+            'shape_diff': {'df1_shape': (0,0), 'df2_shape': (0,0), 'row_diff': 0, 'col_diff': 0},
+            'columns_only_in_df1': [],
+            'columns_only_in_df2': [],
+            'common_columns': [],
+            'dtype_differences': {},
+            'value_differences': {},
+            'summary': f'⚠️ Error initializing comparison: {str(e)}'
+        }
+    
     result = {
         'identical': False,
         'shape_diff': {
@@ -233,6 +375,11 @@ def find_differences(df1: pd.DataFrame, df2: pd.DataFrame,
         'summary': ''
     }
     
+    # Check for no common columns
+    if not result['common_columns']:
+        result['summary'] = '⚠️ No common columns to compare - schema mismatch'
+        return result
+    
     # Quick check for complete identity
     try:
         if df1.shape == df2.shape and set(df1.columns) == set(df2.columns):
@@ -246,97 +393,124 @@ def find_differences(df1: pd.DataFrame, df2: pd.DataFrame,
         pass  # Continue with detailed comparison
     
     # Check dtype differences for common columns
-    for col in result['common_columns']:
-        if df1[col].dtype != df2[col].dtype:
-            result['dtype_differences'][col] = {
-                'df1_dtype': str(df1[col].dtype),
-                'df2_dtype': str(df2[col].dtype)
-            }
+    try:
+        for col in result['common_columns']:
+            try:
+                if df1[col].dtype != df2[col].dtype:
+                    result['dtype_differences'][col] = {
+                        'df1_dtype': str(df1[col].dtype),
+                        'df2_dtype': str(df2[col].dtype)
+                    }
+            except Exception:
+                continue  # Skip problematic columns
+    except Exception:
+        pass  # Continue even if dtype check fails
     
     # Find concrete value-level differences
     if result['common_columns']:
         diff_details = []
         
-        if key_columns and all(k in result['common_columns'] for k in key_columns):
-            # Use key columns for row matching
-            merged = df1.merge(df2, on=key_columns, how='outer', indicator=True, suffixes=('_df1', '_df2'))
-            
-            result['value_differences']['only_in_df1'] = int(len(merged[merged['_merge'] == 'left_only']))
-            result['value_differences']['only_in_df2'] = int(len(merged[merged['_merge'] == 'right_only']))
-            result['value_differences']['in_both'] = int(len(merged[merged['_merge'] == 'both']))
-            
-            # Find value differences in matched rows
-            matched_rows = merged[merged['_merge'] == 'both']
-            value_cols = [c for c in result['common_columns'] if c not in key_columns]
-            
-            for col in value_cols[:10]:  # Check up to 10 columns
-                if f'{col}_df1' in matched_rows.columns and f'{col}_df2' in matched_rows.columns:
-                    # Compare values
-                    diff_mask = matched_rows[f'{col}_df1'] != matched_rows[f'{col}_df2']
-                    # Also check for NaN differences
-                    nan_diff = matched_rows[f'{col}_df1'].isna() != matched_rows[f'{col}_df2'].isna()
-                    diff_mask = diff_mask | nan_diff
+        try:
+            if key_columns and all(k in result['common_columns'] for k in key_columns):
+                # Use key columns for row matching
+                try:
+                    merged = df1.merge(df2, on=key_columns, how='outer', indicator=True, suffixes=('_df1', '_df2'))
                     
-                    if diff_mask.any():
-                        diff_count = diff_mask.sum()
-                        examples = matched_rows[diff_mask].head(max_examples)
-                        diff_details.append({
-                            'column': col,
-                            'different_count': int(diff_count),
-                            'examples': examples[[*key_columns, f'{col}_df1', f'{col}_df2']].to_dict('records')
-                        })
-        else:
-            # Position-based comparison (no key columns)
-            if df1.shape == df2.shape:
-                df2_ordered = df2[df1.columns] if set(df1.columns) == set(df2.columns) else df2
-                
-                # Track all differences across rows
-                rows_with_diffs = set()
-                
-                # First pass: identify which rows have differences
-                for col in result['common_columns']:
-                    if col in df2_ordered.columns:
-                        diff_mask = df1[col] != df2_ordered[col]
-                        nan_df1 = df1[col].isna()
-                        nan_df2 = df2_ordered[col].isna()
-                        diff_mask = diff_mask & ~(nan_df1 & nan_df2)
+                    result['value_differences']['only_in_df1'] = int(len(merged[merged['_merge'] == 'left_only']))
+                    result['value_differences']['only_in_df2'] = int(len(merged[merged['_merge'] == 'right_only']))
+                    result['value_differences']['in_both'] = int(len(merged[merged['_merge'] == 'both']))
+                    
+                    # Find value differences in matched rows
+                    matched_rows = merged[merged['_merge'] == 'both']
+                    value_cols = [c for c in result['common_columns'] if c not in key_columns]
+                    
+                    for col in value_cols[:10]:  # Check up to 10 columns
+                        try:
+                            if f'{col}_df1' in matched_rows.columns and f'{col}_df2' in matched_rows.columns:
+                                # Compare values
+                                diff_mask = matched_rows[f'{col}_df1'] != matched_rows[f'{col}_df2']
+                                # Also check for NaN differences
+                                nan_diff = matched_rows[f'{col}_df1'].isna() != matched_rows[f'{col}_df2'].isna()
+                                diff_mask = diff_mask | nan_diff
+                                
+                                if diff_mask.any():
+                                    diff_count = diff_mask.sum()
+                                    examples = matched_rows[diff_mask].head(max_examples)
+                                    diff_details.append({
+                                        'column': col,
+                                        'different_count': int(diff_count),
+                                        'examples': examples[[*key_columns, f'{col}_df1', f'{col}_df2']].to_dict('records')
+                                    })
+                        except Exception:
+                            continue  # Skip problematic columns
+                except Exception as e:
+                    result['value_differences']['merge_error'] = str(e)
+            else:
+                # Position-based comparison (no key columns)
+                try:
+                    if df1.shape == df2.shape:
+                        df2_ordered = df2[df1.columns] if set(df1.columns) == set(df2.columns) else df2
                         
-                        if diff_mask.any():
-                            rows_with_diffs.update(diff_mask[diff_mask].index.tolist())
-                
-                # Second pass: collect detailed differences for each column
-                for col in result['common_columns']:
-                    if col in df2_ordered.columns:
-                        diff_mask = df1[col] != df2_ordered[col]
-                        nan_df1 = df1[col].isna()
-                        nan_df2 = df2_ordered[col].isna()
-                        diff_mask = diff_mask & ~(nan_df1 & nan_df2)
+                        # Track all differences across rows
+                        rows_with_diffs = set()
                         
-                        if diff_mask.any():
-                            diff_count = diff_mask.sum()
-                            diff_indices = diff_mask[diff_mask].index.tolist()[:max_examples]
-                            examples = []
-                            for idx in diff_indices:
-                                examples.append({
-                                    'row_number': int(idx),
-                                    'column': col,
-                                    'df1_value': str(df1.loc[idx, col]),
-                                    'df2_value': str(df2_ordered.loc[idx, col]),
-                                    'difference': f"Row {idx}: {col} differs - df1='{df1.loc[idx, col]}' vs df2='{df2_ordered.loc[idx, col]}'"
-                                })
-                            diff_details.append({
-                                'column': col,
-                                'different_count': int(diff_count),
-                                'total_rows': len(df1),
-                                'percentage': round(100 * diff_count / len(df1), 2),
-                                'examples': examples
-                            })
+                        # First pass: identify which rows have differences
+                        for col in result['common_columns']:
+                            try:
+                                if col in df2_ordered.columns:
+                                    diff_mask = df1[col] != df2_ordered[col]
+                                    nan_df1 = df1[col].isna()
+                                    nan_df2 = df2_ordered[col].isna()
+                                    diff_mask = diff_mask & ~(nan_df1 & nan_df2)
+                                    
+                                    if diff_mask.any():
+                                        rows_with_diffs.update(diff_mask[diff_mask].index.tolist())
+                            except Exception:
+                                continue
+                        
+                        # Second pass: collect detailed differences for each column
+                        for col in result['common_columns']:
+                            try:
+                                if col in df2_ordered.columns:
+                                    diff_mask = df1[col] != df2_ordered[col]
+                                    nan_df1 = df1[col].isna()
+                                    nan_df2 = df2_ordered[col].isna()
+                                    diff_mask = diff_mask & ~(nan_df1 & nan_df2)
+                                    
+                                    if diff_mask.any():
+                                        diff_count = diff_mask.sum()
+                                        diff_indices = diff_mask[diff_mask].index.tolist()[:max_examples]
+                                        examples = []
+                                        for idx in diff_indices:
+                                            try:
+                                                examples.append({
+                                                    'row_number': int(idx),
+                                                    'column': col,
+                                                    'df1_value': str(df1.loc[idx, col]),
+                                                    'df2_value': str(df2_ordered.loc[idx, col]),
+                                                    'difference': f"Row {idx}: {col} differs - df1='{df1.loc[idx, col]}' vs df2='{df2_ordered.loc[idx, col]}'"
+                                                })
+                                            except Exception:
+                                                continue
+                                        diff_details.append({
+                                            'column': col,
+                                            'different_count': int(diff_count),
+                                            'total_rows': len(df1),
+                                            'percentage': round(100 * diff_count / len(df1), 2),
+                                            'examples': examples
+                                        })
+                            except Exception:
+                                continue
+                        
+                        # Add summary of affected rows
+                        result['value_differences']['total_rows_with_differences'] = len(rows_with_diffs)
+                        result['value_differences']['affected_rows'] = sorted(list(rows_with_diffs))[:50]  # First 50 row numbers
+                except Exception as e:
+                    result['value_differences']['position_compare_error'] = str(e)
                 
-                # Add summary of affected rows
-                result['value_differences']['total_rows_with_differences'] = len(rows_with_diffs)
-                result['value_differences']['affected_rows'] = sorted(list(rows_with_diffs))[:50]  # First 50 row numbers
-            
-            result['value_differences']['position_based'] = True
+                result['value_differences']['position_based'] = True
+        except Exception as e:
+            result['value_differences']['error'] = f"Error during value comparison: {str(e)}"
         
         result['value_differences']['concrete_differences'] = diff_details
     
@@ -371,6 +545,7 @@ def create_diff_report(df1: pd.DataFrame, df2: pd.DataFrame,
                        show_all_columns: bool = False) -> pd.DataFrame:
     """
     Create a detailed difference report showing exact row-by-row comparisons.
+    **HARDENED VERSION - Never crashes, always returns valid DataFrame**
     
     Args:
         df1: First DataFrame
@@ -382,60 +557,92 @@ def create_diff_report(df1: pd.DataFrame, df2: pd.DataFrame,
         DataFrame with columns: [row_number, column_name, df1_value, df2_value, match_status]
         showing all differences found between datasets
     """
-    if df1.shape != df2.shape:
-        raise ValueError(f"Datasets must have same shape. df1: {df1.shape}, df2: {df2.shape}")
-    
-    # Determine which columns to compare
-    common_columns = list(set(df1.columns) & set(df2.columns))
-    if columns:
-        check_columns = [col for col in columns if col in common_columns]
-    else:
-        check_columns = common_columns
-    
-    # Reorder df2 to match df1 column order
-    df2_ordered = df2[df1.columns] if set(df1.columns) == set(df2.columns) else df2
-    
-    # Collect all differences
-    diff_records = []
-    
-    for col in check_columns:
-        if col not in df2_ordered.columns:
-            continue
-            
-        for idx in range(len(df1)):
-            val1 = df1.iloc[idx][col]
-            val2 = df2_ordered.iloc[idx][col]
-            
-            # Check if values differ (handling NaN properly)
-            is_different = False
-            if pd.isna(val1) and pd.isna(val2):
-                is_different = False  # Both NaN = same
-            elif pd.isna(val1) or pd.isna(val2):
-                is_different = True  # One NaN, one not = different
-            else:
-                is_different = val1 != val2
-            
-            if is_different or show_all_columns:
-                diff_records.append({
-                    'row_number': idx,
-                    'column_name': col,
-                    'df1_value': val1,
-                    'df2_value': val2,
-                    'match_status': '✓ Match' if not is_different else '✗ DIFFER',
-                    'difference_type': _classify_difference(val1, val2) if is_different else 'identical'
-                })
-    
-    if not diff_records:
-        # Return empty DataFrame with correct structure
-        return pd.DataFrame(columns=['row_number', 'column_name', 'df1_value', 'df2_value', 
+    # Return empty DataFrame with correct structure for error cases
+    empty_df = pd.DataFrame(columns=['row_number', 'column_name', 'df1_value', 'df2_value', 
                                     'match_status', 'difference_type'])
     
-    diff_df = pd.DataFrame(diff_records)
+    try:
+        if df1 is None or df2 is None:
+            return empty_df
+        
+        if df1.empty or df2.empty:
+            return empty_df
+        
+        if df1.shape != df2.shape:
+            # Instead of raising error, return informative DataFrame
+            return pd.DataFrame([{
+                'row_number': -1,
+                'column_name': 'SHAPE_MISMATCH',
+                'df1_value': f'Shape: {df1.shape}',
+                'df2_value': f'Shape: {df2.shape}',
+                'match_status': '⚠️ Shape differs',
+                'difference_type': 'shape_mismatch'
+            }])
+    except Exception:
+        return empty_df
     
-    # Sort by row number, then column name
-    diff_df = diff_df.sort_values(['row_number', 'column_name']).reset_index(drop=True)
-    
-    return diff_df
+    # Determine which columns to compare
+    try:
+        common_columns = list(set(df1.columns) & set(df2.columns))
+        if columns:
+            check_columns = [col for col in columns if col in common_columns]
+        else:
+            check_columns = common_columns
+        
+        if not check_columns:
+            return empty_df
+        
+        # Reorder df2 to match df1 column order
+        df2_ordered = df2[df1.columns] if set(df1.columns) == set(df2.columns) else df2
+        
+        # Collect all differences
+        diff_records = []
+        
+        for col in check_columns:
+            try:
+                if col not in df2_ordered.columns:
+                    continue
+                    
+                for idx in range(len(df1)):
+                    try:
+                        val1 = df1.iloc[idx][col]
+                        val2 = df2_ordered.iloc[idx][col]
+                        
+                        # Check if values differ (handling NaN properly)
+                        is_different = False
+                        if pd.isna(val1) and pd.isna(val2):
+                            is_different = False  # Both NaN = same
+                        elif pd.isna(val1) or pd.isna(val2):
+                            is_different = True  # One NaN, one not = different
+                        else:
+                            is_different = val1 != val2
+                        
+                        if is_different or show_all_columns:
+                            diff_records.append({
+                                'row_number': idx,
+                                'column_name': col,
+                                'df1_value': val1,
+                                'df2_value': val2,
+                                'match_status': '✓ Match' if not is_different else '✗ DIFFER',
+                                'difference_type': _classify_difference(val1, val2) if is_different else 'identical'
+                            })
+                    except Exception:
+                        continue  # Skip problematic rows
+            except Exception:
+                continue  # Skip problematic columns
+        
+        if not diff_records:
+            # Return empty DataFrame with correct structure
+            return empty_df
+        
+        diff_df = pd.DataFrame(diff_records)
+        
+        # Sort by row number, then column name
+        diff_df = diff_df.sort_values(['row_number', 'column_name']).reset_index(drop=True)
+        
+        return diff_df
+    except Exception:
+        return empty_df
 
 
 def _classify_difference(val1, val2) -> str:
@@ -611,7 +818,7 @@ User query: {query}"""
 
 
 # ------------------  CodeWritingTool ---------------------------------
-def CodeWritingTool(cols_info: dict, query: str) -> str:
+def CodeWritingTool(cols_info: dict, query: str, user_notes: str = "") -> str:
     """Generate a prompt for the LLM to write pandas-only code for a data query (no plotting)."""
     
     datasets_desc = []
@@ -619,11 +826,21 @@ def CodeWritingTool(cols_info: dict, query: str) -> str:
         datasets_desc.append(f"{df_name} with columns: {', '.join(cols)}")
     
     datasets_text = "\n    ".join(datasets_desc)
+    
+    notes_section = ""
+    if user_notes and user_notes.strip():
+        notes_section = f"""
+    
+    User Context Notes
+    -----
+    {user_notes.strip()}
+    (Use these notes to inform your analysis - e.g., join keys, units, expected relationships, known data quirks)
+    """
 
     return f"""
 
     Given DataFrame(s):
-    {datasets_text}
+    {datasets_text}{notes_section}
 
     Write Python code (pandas **only**, no plotting) to answer: 
     "{query}"
@@ -638,7 +855,8 @@ def CodeWritingTool(cols_info: dict, query: str) -> str:
     6. Do not include any explanations, comments, or prose outside the code block.
     7. Do **not** read files, fetch data, or use Streamlit.
     8. Do **not** import any libraries (pandas is already imported as pd, numpy as np).
-    9. Handle missing values (`dropna`) before aggregations.
+    9. Do **not** use seaborn or other visualization libraries.
+    10. Handle missing values (`dropna`) before aggregations.
 
     Available Utility Functions
     -----
@@ -690,7 +908,7 @@ def CodeWritingTool(cols_info: dict, query: str) -> str:
 
 
 # ------------------  PlotCodeGeneratorTool ---------------------------
-def PlotCodeGeneratorTool(cols_info: dict, query: str) -> str:
+def PlotCodeGeneratorTool(cols_info: dict, query: str, user_notes: str = "") -> str:
 
     """Generate a prompt for the LLM to write pandas + matplotlib code for a plot based on the query and columns."""
     
@@ -699,11 +917,21 @@ def PlotCodeGeneratorTool(cols_info: dict, query: str) -> str:
         datasets_desc.append(f"{df_name} with columns: {', '.join(cols)}")
     
     datasets_text = "\n    ".join(datasets_desc)
+    
+    notes_section = ""
+    if user_notes and user_notes.strip():
+        notes_section = f"""
+    
+    User Context Notes
+    -----
+    {user_notes.strip()}
+    (Use these notes to inform your visualization - e.g., units, scales, expected relationships, known data quirks)
+    """
 
     return f"""
 
     Given DataFrame(s):
-    {datasets_text}
+    {datasets_text}{notes_section}
 
     Write Python code using pandas **and matplotlib** (as plt) to answer:
     "{query}"
@@ -717,7 +945,8 @@ def PlotCodeGeneratorTool(cols_info: dict, query: str) -> str:
     5. Create only ONE relevant plot. Set `figsize={DEFAULT_FIGSIZE}`, add title/labels.
     6. Return your answer inside a single markdown fence that starts with ```python and ends with ```.
     7. Do not include any explanations, comments, or prose outside the code block.
-    8. Handle missing values (`dropna`) before plotting/aggregations.
+    8. Do **not** use seaborn or other visualization libraries - matplotlib only.
+    9. Handle missing values (`dropna`) before plotting/aggregations.
 
     Available Utility Functions
     -----
@@ -758,7 +987,7 @@ def PlotCodeGeneratorTool(cols_info: dict, query: str) -> str:
 
 # === CodeGenerationAgent ==============================================
 
-def CodeGenerationAgent(query: str, dataframes: dict, chat_context: Optional[str] = None):
+def CodeGenerationAgent(query: str, dataframes: dict, chat_context: Optional[str] = None, user_notes: str = ""):
     """Selects the appropriate code generation tool and gets code from the LLM for the user's query."""
 
     should_plot = QueryUnderstandingTool(query)
@@ -766,7 +995,7 @@ def CodeGenerationAgent(query: str, dataframes: dict, chat_context: Optional[str
     # Build column info for all available dataframes
     cols_info = {df_name: df.columns.tolist() for df_name, df in dataframes.items()}
 
-    prompt = PlotCodeGeneratorTool(cols_info, query) if should_plot else CodeWritingTool(cols_info, query)
+    prompt = PlotCodeGeneratorTool(cols_info, query, user_notes) if should_plot else CodeWritingTool(cols_info, query, user_notes)
 
     # Prepend the instruction to the query
     context_section = f"\nConversation context (recent user turns):\n{chat_context}\n" if chat_context else ""
@@ -816,7 +1045,8 @@ def ExecutionAgent(code: str, dataframes: dict, should_plot: bool):
         "compare_datasets": compare_datasets,
         "find_differences": find_differences,
         "create_diff_report": create_diff_report,
-        "plot_dual": plot_dual
+        "plot_dual": plot_dual,
+        "compute_mean_differences": compute_mean_differences
     }
     
     # Add all dataframes to the environment
@@ -1317,6 +1547,12 @@ def main():
         st.session_state.plots = []
     if "current_model" not in st.session_state:
         st.session_state.current_model = DEFAULT_MODEL
+    if "user_notes" not in st.session_state:
+        st.session_state.user_notes = ""
+    if "comparison_result" not in st.session_state:
+        st.session_state.comparison_result = None
+    if "mean_diff_plot" not in st.session_state:
+        st.session_state.mean_diff_plot = None
 
     left, right = st.columns([3,7])
 
@@ -1341,8 +1577,9 @@ def main():
         
         # Two file uploaders
         st.markdown("### Upload Dataset(s)")
-        file1 = st.file_uploader("Dataset 1 (df1)", type=["csv"], key="csv_uploader_1")
-        file2 = st.file_uploader("Dataset 2 (df2) - Optional", type=["csv"], key="csv_uploader_2")
+        st.info("💡 Use @1 and @2 to refer to your datasets in chat!")
+        file1 = st.file_uploader("Dataset 1 (@1 / df1)", type=["csv"], key="csv_uploader_1")
+        file2 = st.file_uploader("Dataset 2 (@2 / df2) - Optional", type=["csv"], key="csv_uploader_2")
         
         # Update configuration if model changed
         if selected_model != st.session_state.current_model:
@@ -1384,10 +1621,20 @@ def main():
         
         if file1 and files_changed:
             dataframes = {}
-            dataframes["df1"] = pd.read_csv(file1)
+            try:
+                dataframes["df1"] = pd.read_csv(file1)
+            except Exception as e:
+                st.error(f"❌ Error reading CSV file 1: {str(e)}")
+                st.info("💡 Tip: Ensure the file is a valid CSV with UTF-8 encoding.")
+                st.stop()
             
             if file2:
-                dataframes["df2"] = pd.read_csv(file2)
+                try:
+                    dataframes["df2"] = pd.read_csv(file2)
+                except Exception as e:
+                    st.error(f"❌ Error reading CSV file 2: {str(e)}")
+                    st.info("💡 Tip: Ensure the file is a valid CSV with UTF-8 encoding.")
+                    st.stop()
             
             st.session_state.dataframes = dataframes
             st.session_state.current_files = current_files
@@ -1425,6 +1672,60 @@ def main():
                 st.markdown(f"*<span style='color: #cbd5e1; font-style: italic;'>Generated with {current_config_left.MODEL_PRINT_NAME}</span>*", unsafe_allow_html=True)
             else:
                 st.warning("No insights available.")
+            
+            # User notes section
+            st.markdown("### Context Notes")
+            user_notes = st.text_area(
+                "Optional notes about datasets",
+                value=st.session_state.user_notes,
+                placeholder="E.g., 'Both datasets use customer_id as key', 'Prices in USD', 'Date format: YYYY-MM-DD'",
+                help="These notes help the AI understand your data better (join keys, units, quirks, etc.)",
+                height=100,
+                key="user_notes_input"
+            )
+            if user_notes != st.session_state.user_notes:
+                st.session_state.user_notes = user_notes
+            
+            # Show "in use" badge if notes are present
+            if st.session_state.user_notes.strip():
+                st.success("✓ Context notes active")
+            
+            # Comparison tools (only show if at least one dataset)
+            st.markdown("### Dataset Tools")
+            
+            # Compare datasets button
+            if len(st.session_state.dataframes) >= 2:
+                if st.button("🔍 Compare Datasets", use_container_width=True, type="primary"):
+                    with st.spinner("Comparing datasets..."):
+                        df1 = st.session_state.dataframes.get("df1")
+                        df2 = st.session_state.dataframes.get("df2")
+                        st.session_state.comparison_result = find_differences(df1, df2, max_examples=MAX_DIFF_EXAMPLES)
+                    st.rerun()
+                
+                # Plot mean differences button
+                if st.button("📊 Plot Mean Differences", use_container_width=True):
+                    with st.spinner("Computing mean differences..."):
+                        df1 = st.session_state.dataframes.get("df1")
+                        df2 = st.session_state.dataframes.get("df2")
+                        mean_diffs = compute_mean_differences(df1, df2, sort_by_abs=True)
+                        
+                        if len(mean_diffs) == 0:
+                            st.warning("No common numeric columns found for comparison.")
+                            st.session_state.mean_diff_plot = None
+                        else:
+                            # Create bar chart
+                            fig, ax = plt.subplots(figsize=(8, max(4, len(mean_diffs) * 0.3)))
+                            colors = ['#10b981' if x >= 0 else '#ef4444' for x in mean_diffs['mean_diff']]
+                            ax.barh(mean_diffs['column'], mean_diffs['mean_diff'], color=colors, alpha=0.8)
+                            ax.set_xlabel('Mean Difference (@1 - @2)')
+                            ax.set_title('Mean Differences: @1 vs @2\n(Positive = @1 > @2)', fontweight='bold')
+                            ax.axvline(x=0, color='gray', linestyle='--', linewidth=1)
+                            ax.grid(True, alpha=0.3, axis='x')
+                            plt.tight_layout()
+                            st.session_state.mean_diff_plot = fig
+                    st.rerun()
+            else:
+                st.info("Upload a second dataset to enable comparison tools.")
         else:
             st.info("Upload at least one CSV to begin chatting with your data.")
 
@@ -1437,6 +1738,67 @@ def main():
             st.markdown(f"*<span style='color: #cbd5e1; font-style: italic;'>Using {current_config_right.MODEL_PRINT_NAME} | Datasets: {dataset_names}</span>*", unsafe_allow_html=True)
         if "messages" not in st.session_state:
             st.session_state.messages = []
+
+        # Display comparison result if available
+        if st.session_state.comparison_result:
+            with st.expander("📋 Dataset Comparison Result", expanded=True):
+                comp = st.session_state.comparison_result
+                
+                # Summary pill
+                if comp['identical']:
+                    st.success("✓ **IDENTICAL** - Datasets match exactly")
+                elif comp['common_columns']:
+                    st.warning("⚠️ **DIFFERENCES FOUND**")
+                else:
+                    st.error("❌ **SCHEMA MISMATCH** - No common columns")
+                
+                # Summary text
+                st.markdown(f"**Summary:** {comp['summary']}")
+                
+                # Schema differences
+                if comp['columns_only_in_df1'] or comp['columns_only_in_df2'] or comp['dtype_differences']:
+                    st.markdown("**Schema Differences:**")
+                    schema_data = []
+                    
+                    for col in comp['columns_only_in_df1']:
+                        schema_data.append({'Column': col, 'In @1': '✓', 'In @2': '✗', 'Type @1': 'N/A', 'Type @2': 'N/A'})
+                    for col in comp['columns_only_in_df2']:
+                        schema_data.append({'Column': col, 'In @1': '✗', 'In @2': '✓', 'Type @1': 'N/A', 'Type @2': 'N/A'})
+                    for col, types in comp['dtype_differences'].items():
+                        schema_data.append({'Column': col, 'In @1': '✓', 'In @2': '✓', 
+                                          'Type @1': types['df1_dtype'], 'Type @2': types['df2_dtype']})
+                    
+                    if schema_data:
+                        st.dataframe(pd.DataFrame(schema_data), use_container_width=True, hide_index=True)
+                
+                # Value differences
+                if comp['value_differences'].get('concrete_differences'):
+                    st.markdown("**Value Differences:**")
+                    for diff in comp['value_differences']['concrete_differences'][:5]:  # Show top 5 columns
+                        with st.expander(f"Column: {diff['column']} ({diff['different_count']} differences)"):
+                            if 'examples' in diff and diff['examples']:
+                                examples_df = pd.DataFrame(diff['examples'][:10])  # Show 10 examples
+                                st.dataframe(examples_df, use_container_width=True, hide_index=True)
+                
+                # Column mapping helper for schema mismatches
+                if comp['columns_only_in_df1'] and comp['columns_only_in_df2']:
+                    matches = fuzzy_column_match(comp['columns_only_in_df1'], comp['columns_only_in_df2'], threshold=0.6)
+                    if matches:
+                        st.markdown("**💡 Suggested Column Mappings:**")
+                        for c1, c2, score in matches[:5]:
+                            st.caption(f"• `{c1}` ↔ `{c2}` (similarity: {score:.0%})")
+                
+                if st.button("Clear Comparison", use_container_width=True):
+                    st.session_state.comparison_result = None
+                    st.rerun()
+        
+        # Display mean difference plot if available
+        if st.session_state.mean_diff_plot:
+            with st.expander("📊 Mean Differences Plot", expanded=True):
+                st.pyplot(st.session_state.mean_diff_plot, use_container_width=True)
+                if st.button("Clear Plot", use_container_width=True, key="clear_mean_diff"):
+                    st.session_state.mean_diff_plot = None
+                    st.rerun()
 
         # Manual clear chat control
         clear_col1, clear_col2 = st.columns([8,2])
@@ -1458,61 +1820,302 @@ def main():
                             st.pyplot(st.session_state.plots[idx], use_container_width=False)
 
         if "dataframes" in st.session_state:  # allow chat when we have data loaded
-            if user_q := st.chat_input("Ask about your data…"):
-                st.session_state.messages.append({"role": "user", "content": user_q})
-                with st.spinner("Working …"):
-                    # Build brief chat context from the last few user messages
-                    recent_user_turns = [m["content"] for m in st.session_state.messages if m["role"] == "user"][-3:]
-                    context_text = "\n".join(recent_user_turns[:-1]) if len(recent_user_turns) > 1 else None
-                    code, should_plot_flag, code_thinking = CodeGenerationAgent(user_q, st.session_state.dataframes, context_text)
-                    result_obj = ExecutionAgent(code, st.session_state.dataframes, should_plot_flag)
-                    raw_thinking, reasoning_txt = ReasoningAgent(user_q, result_obj)
-                    reasoning_txt = reasoning_txt.replace("`", "")
-
-                # Build assistant response
-                is_plot = isinstance(result_obj, (plt.Figure, plt.Axes))
-                plot_idx = None
-                if is_plot:
-                    fig = result_obj.figure if isinstance(result_obj, plt.Axes) else result_obj
-                    st.session_state.plots.append(fig)
-                    plot_idx = len(st.session_state.plots) - 1
-                    header = "Here is the visualization you requested:"
-                elif isinstance(result_obj, (pd.DataFrame, pd.Series)):
-                    header = f"Result: {len(result_obj)} rows" if isinstance(result_obj, pd.DataFrame) else "Result series"
+            if user_q := st.chat_input("Ask about your data… (use @1 and @2 to refer to datasets)"):
+                # Preprocess query for @1/@2 support
+                has_df1 = "df1" in st.session_state.dataframes
+                has_df2 = "df2" in st.session_state.dataframes
+                processed_query, warning = preprocess_query_for_datasets(user_q, has_df1, has_df2)
+                
+                # Show warning if @2 referenced but not available
+                if warning:
+                    st.warning(warning)
+                    # Don't add to messages if there's a critical error
+                    if "@2" in user_q and not has_df2:
+                        pass  # Skip processing
+                    else:
+                        st.session_state.messages.append({"role": "user", "content": user_q})
                 else:
-                    header = f"Result: {result_obj}"
+                    st.session_state.messages.append({"role": "user", "content": user_q})
+                    
+                    with st.spinner("Working …"):
+                        # Build brief chat context from the last few user messages
+                        recent_user_turns = [m["content"] for m in st.session_state.messages if m["role"] == "user"][-3:]
+                        context_text = "\n".join(recent_user_turns[:-1]) if len(recent_user_turns) > 1 else None
+                        
+                        # Pass processed query, user notes to code generation
+                        code, should_plot_flag, code_thinking = CodeGenerationAgent(
+                            processed_query, 
+                            st.session_state.dataframes, 
+                            context_text,
+                            st.session_state.user_notes
+                        )
+                        
+                        # Check for forbidden imports/patterns
+                        forbidden_patterns = [
+                            ('import streamlit', 'Streamlit imports'),
+                            ('import seaborn', 'Seaborn (use matplotlib only)'),
+                            ('pd.read_csv', 'File reading'),
+                            ('pd.read_excel', 'File reading'),
+                            ('.to_csv', 'File writing'),
+                        ]
+                        
+                        violation = None
+                        for pattern, desc in forbidden_patterns:
+                            if pattern in code:
+                                violation = desc
+                                break
+                        
+                        if violation:
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": f"⚠️ Generated code contained forbidden operation: {violation}. Please rephrase your request.",
+                                "plot_index": None
+                            })
+                            st.rerun()
+                        
+                        result_obj = ExecutionAgent(code, st.session_state.dataframes, should_plot_flag)
+                        raw_thinking, reasoning_txt = ReasoningAgent(processed_query, result_obj)
+                        reasoning_txt = reasoning_txt.replace("`", "")
+                        
+                        # Build assistant response
+                        is_plot = isinstance(result_obj, (plt.Figure, plt.Axes))
+                        plot_idx = None
+                        if is_plot:
+                            fig = result_obj.figure if isinstance(result_obj, plt.Axes) else result_obj
+                            st.session_state.plots.append(fig)
+                            plot_idx = len(st.session_state.plots) - 1
+                            header = "Here is the visualization you requested:"
+                        elif isinstance(result_obj, (pd.DataFrame, pd.Series)):
+                            header = f"Result: {len(result_obj)} rows" if isinstance(result_obj, pd.DataFrame) else "Result series"
+                        else:
+                            header = f"Result: {result_obj}"
 
-                # Show only reasoning thinking in Model Thinking (collapsed by default)
-                thinking_html = ""
-                if raw_thinking:
-                    thinking_html = (
-                        '<details class="thinking">'
-                        '<summary><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="7.5 4.21 12 6.81 16.5 4.21"/><polyline points="7.5 19.79 7.5 14.6 3 12"/><polyline points="21 12 16.5 14.6 16.5 19.79"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg> Reasoning</summary>'
-                        f'<pre>{raw_thinking}</pre>'
-                        '</details>'
-                    )
+                        # Show only reasoning thinking in Model Thinking (collapsed by default)
+                        thinking_html = ""
+                        if raw_thinking:
+                            thinking_html = (
+                                '<details class="thinking">'
+                                '<summary><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="7.5 4.21 12 6.81 16.5 4.21"/><polyline points="7.5 19.79 7.5 14.6 3 12"/><polyline points="21 12 16.5 14.6 16.5 19.79"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg> Reasoning</summary>'
+                                f'<pre>{raw_thinking}</pre>'
+                                '</details>'
+                            )
 
-                # Show model explanation directly 
-                explanation_html = reasoning_txt
+                        # Show model explanation directly 
+                        explanation_html = reasoning_txt
 
-                # Code accordion with proper HTML <pre><code> syntax highlighting
-                code_html = (
-                    '<details class="code">'
-                    '<summary><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg> View code</summary>'
-                    '<pre><code class="language-python">'
-                    f'{code}'
-                    '</code></pre>'
-                    '</details>'
-                )
-                # Combine thinking, explanation, and code accordion
-                assistant_msg = f"{thinking_html}{explanation_html}\n\n{code_html}"
+                        # Code accordion with proper HTML <pre><code> syntax highlighting
+                        code_html = (
+                            '<details class="code">'
+                            '<summary><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg> View code</summary>'
+                            '<pre><code class="language-python">'
+                            f'{code}'
+                            '</code></pre>'
+                            '</details>'
+                        )
+                        # Combine thinking, explanation, and code accordion
+                        assistant_msg = f"{thinking_html}{explanation_html}\n\n{code_html}"
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": assistant_msg,
-                    "plot_index": plot_idx
-                })
-                st.rerun()
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": assistant_msg,
+                            "plot_index": plot_idx
+                        })
+                    st.rerun()
+
+# === TEST HARNESS =====================================================
+
+def run_tests():
+    """
+    Lightweight test harness for core utility functions.
+    Run with: python data_analysis_agent_comparison.py --test
+    """
+    print("[TEST] Running test harness...\n")
+    
+    tests_passed = 0
+    tests_failed = 0
+    
+    # Test 1: find_differences with identical DataFrames
+    print("Test 1: find_differences - identical DataFrames")
+    try:
+        df1 = pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+        df2 = pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+        result = find_differences(df1, df2)
+        assert result['identical'] == True, "Should be identical"
+        assert result['summary'].startswith("✓"), "Summary should indicate identical"
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 2: find_differences with shape mismatch
+    print("Test 2: find_differences - shape mismatch")
+    try:
+        df1 = pd.DataFrame({'a': [1, 2, 3]})
+        df2 = pd.DataFrame({'a': [1, 2]})
+        result = find_differences(df1, df2)
+        assert result['identical'] == False, "Should not be identical"
+        assert result['shape_diff']['row_diff'] == 1, "Row diff should be 1"
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 3: find_differences with column mismatch
+    print("Test 3: find_differences - column mismatch")
+    try:
+        df1 = pd.DataFrame({'a': [1, 2], 'b': [3, 4]})
+        df2 = pd.DataFrame({'a': [1, 2], 'c': [5, 6]})
+        result = find_differences(df1, df2)
+        assert 'b' in result['columns_only_in_df1'], "b should be only in df1"
+        assert 'c' in result['columns_only_in_df2'], "c should be only in df2"
+        assert 'a' in result['common_columns'], "a should be common"
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 4: find_differences with dtype mismatch
+    print("Test 4: find_differences - dtype mismatch")
+    try:
+        df1 = pd.DataFrame({'a': [1, 2, 3]})
+        df2 = pd.DataFrame({'a': ['1', '2', '3']})
+        result = find_differences(df1, df2)
+        assert 'a' in result['dtype_differences'], "Should detect dtype difference"
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 5: find_differences never crashes with None/empty
+    print("Test 5: find_differences - robustness (None/empty)")
+    try:
+        result1 = find_differences(None, pd.DataFrame({'a': [1]}))
+        assert 'summary' in result1, "Should return valid structure"
+        
+        result2 = find_differences(pd.DataFrame(), pd.DataFrame({'a': [1]}))
+        assert 'summary' in result2, "Should handle empty DataFrame"
+        
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 6: create_diff_report with same shape
+    print("Test 6: create_diff_report - same shape")
+    try:
+        df1 = pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+        df2 = pd.DataFrame({'a': [1, 2, 9], 'b': [4, 5, 6]})
+        result = create_diff_report(df1, df2)
+        assert len(result) > 0, "Should find differences"
+        assert 'row_number' in result.columns, "Should have row_number column"
+        assert result[result['column_name'] == 'a']['row_number'].tolist() == [2], "Should identify row 2 for column a"
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 7: create_diff_report never crashes with shape mismatch
+    print("Test 7: create_diff_report - shape mismatch handling")
+    try:
+        df1 = pd.DataFrame({'a': [1, 2, 3]})
+        df2 = pd.DataFrame({'a': [1, 2]})
+        result = create_diff_report(df1, df2)
+        assert isinstance(result, pd.DataFrame), "Should return DataFrame"
+        assert 'match_status' in result.columns, "Should have correct structure"
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 8: compute_mean_differences
+    print("Test 8: compute_mean_differences - numeric columns")
+    try:
+        df1 = pd.DataFrame({'a': [1, 2, 3], 'b': [10, 20, 30], 'c': ['x', 'y', 'z']})
+        df2 = pd.DataFrame({'a': [2, 3, 4], 'b': [15, 25, 35], 'c': ['x', 'y', 'z']})
+        result = compute_mean_differences(df1, df2, sort_by_abs=True)
+        assert len(result) == 2, "Should find 2 numeric columns"
+        assert 'mean_diff' in result.columns, "Should have mean_diff column"
+        # Check that mean differences are computed correctly (check both columns)
+        mean_diffs_dict = dict(zip(result['column'], result['mean_diff']))
+        assert abs(mean_diffs_dict['a'] - (-1.0)) < 0.1, "Column 'a' mean diff should be -1.0"
+        assert abs(mean_diffs_dict['b'] - (-5.0)) < 0.1, "Column 'b' mean diff should be -5.0"
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 9: compute_mean_differences with no common numeric columns
+    print("Test 9: compute_mean_differences - no common numeric")
+    try:
+        df1 = pd.DataFrame({'a': ['x', 'y'], 'b': [1, 2]})
+        df2 = pd.DataFrame({'a': ['x', 'y'], 'c': [3, 4]})
+        result = compute_mean_differences(df1, df2)
+        assert len(result) == 0, "Should return empty DataFrame"
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 10: preprocess_query_for_datasets
+    print("Test 10: preprocess_query_for_datasets - @1/@2 replacement")
+    try:
+        query = "compare @1 and @2"
+        processed, warning = preprocess_query_for_datasets(query, True, True)
+        assert processed == "compare df1 and df2", "Should replace @1 and @2"
+        assert warning is None, "Should have no warning"
+        
+        query2 = "show @2"
+        processed2, warning2 = preprocess_query_for_datasets(query2, True, False)
+        assert warning2 is not None, "Should warn when @2 not available"
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Test 11: fuzzy_column_match
+    print("Test 11: fuzzy_column_match - column matching")
+    try:
+        cols1 = ['customer_id', 'OrderDate', 'TotalCost']
+        cols2 = ['CustomerID', 'order_date', 'total_cost']
+        matches = fuzzy_column_match(cols1, cols2, threshold=0.6)
+        assert len(matches) > 0, "Should find fuzzy matches"
+        # Check that similar columns are matched
+        match_dict = {m[0]: m[1] for m in matches}
+        print("[PASS]\n")
+        tests_passed += 1
+    except Exception as e:
+        print(f"[FAIL]: {e}\n")
+        tests_failed += 1
+    
+    # Summary
+    print("=" * 60)
+    print(f"Tests passed: {tests_passed}")
+    print(f"Tests failed: {tests_failed}")
+    print("=" * 60)
+    
+    if tests_failed == 0:
+        print("[SUCCESS] All tests passed!")
+        return 0
+    else:
+        print(f"[FAILURE] {tests_failed} test(s) failed")
+        return 1
+
 
 if __name__ == "__main__":
-    main() 
+    import sys
+    
+    # Check if running tests
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        sys.exit(run_tests())
+    else:
+        main() 

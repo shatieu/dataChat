@@ -1011,6 +1011,34 @@ def main():
             color: #e8f1ff;
         }
         
+        /* Top Header Bar */
+        header[data-testid="stHeader"] {
+            background: linear-gradient(135deg, #1a1f3a 0%, #0f1629 100%) !important;
+            border-bottom: 1px solid rgba(59, 130, 246, 0.3) !important;
+        }
+        
+        /* Custom App Title in Top Bar */
+        .app-title-bar {
+            background: linear-gradient(135deg, #1a1f3a 0%, #0f1629 100%);
+            padding: 1rem 2rem;
+            border-bottom: 1px solid rgba(59, 130, 246, 0.3);
+            margin: -1rem -1rem 2rem -1rem;
+        }
+        
+        .app-title-bar h1 {
+            color: #e8f1ff;
+            font-size: 1.8rem;
+            font-weight: 600;
+            margin: 0;
+            text-shadow: 0 0 20px rgba(59, 130, 246, 0.4);
+        }
+        
+        .app-title-bar .subtitle {
+            color: #cbd5e1;
+            font-size: 0.9rem;
+            margin-top: 0.25rem;
+        }
+        
         /* Headers */
         h1, h2, h3 {
             color: #ffffff;
@@ -1065,6 +1093,21 @@ def main():
             border-radius: 8px !important;
         }
         
+        [data-baseweb="select"] > div {
+            color: #e8f1ff !important;
+        }
+        
+        /* Labels and Text */
+        label, .stMarkdown, p {
+            color: #cbd5e1 !important;
+        }
+        
+        /* File uploader text */
+        [data-testid="stFileUploader"] label,
+        [data-testid="stFileUploader"] small {
+            color: #cbd5e1 !important;
+        }
+        
         /* Chat Input */
         .stChatInput > div > div > input {
             background: rgba(15, 23, 42, 0.8);
@@ -1112,7 +1155,7 @@ def main():
             background: rgba(10, 14, 39, 0.8) !important;
             border: 1px solid rgba(59, 130, 246, 0.2) !important;
             border-radius: 8px !important;
-            color: #94a3b8 !important;
+            color: #cbd5e1 !important;
         }
         
         /* Details/Accordion */
@@ -1262,6 +1305,14 @@ def main():
     </style>
     """, unsafe_allow_html=True)
     
+    # Add custom app title bar
+    st.markdown("""
+        <div class="app-title-bar">
+            <h1>🤖 DataChat AI</h1>
+            <div class="subtitle">Intelligent Data Analysis Powered by NVIDIA</div>
+        </div>
+    """, unsafe_allow_html=True)
+    
     if "plots" not in st.session_state:
         st.session_state.plots = []
     if "current_model" not in st.session_state:
@@ -1286,7 +1337,7 @@ def main():
         # Get current config for the "Powered by" text - use selected_model for immediate updates
         display_config = MODEL_CONFIGS[selected_model]
 
-        st.markdown(f"<medium>Powered by <a href='{display_config.MODEL_URL}'>{display_config.MODEL_PRINT_NAME}</a></medium>", unsafe_allow_html=True)
+        st.markdown(f"<p style='color: #cbd5e1; font-size: 0.9em;'>Powered by <a href='{display_config.MODEL_URL}'>{display_config.MODEL_PRINT_NAME}</a></p>", unsafe_allow_html=True)
         
         # Two file uploaders
         st.markdown("### Upload Dataset(s)")
@@ -1371,7 +1422,7 @@ def main():
                 st.markdown(st.session_state.insights)
                 # Get current config dynamically for model attribution
                 current_config_left = get_current_config()
-                st.markdown(f"*<span style='color: grey; font-style: italic;'>Generated with {current_config_left.MODEL_PRINT_NAME}</span>*", unsafe_allow_html=True)
+                st.markdown(f"*<span style='color: #cbd5e1; font-style: italic;'>Generated with {current_config_left.MODEL_PRINT_NAME}</span>*", unsafe_allow_html=True)
             else:
                 st.warning("No insights available.")
         else:
@@ -1383,14 +1434,14 @@ def main():
             # Get current config dynamically for the right column
             current_config_right = get_current_config()
             dataset_names = ", ".join(st.session_state.dataframes.keys())
-            st.markdown(f"*<span style='color: grey; font-style: italic;'>Using {current_config_right.MODEL_PRINT_NAME} | Datasets: {dataset_names}</span>*", unsafe_allow_html=True)
+            st.markdown(f"*<span style='color: #cbd5e1; font-style: italic;'>Using {current_config_right.MODEL_PRINT_NAME} | Datasets: {dataset_names}</span>*", unsafe_allow_html=True)
         if "messages" not in st.session_state:
             st.session_state.messages = []
 
         # Manual clear chat control
-        clear_col1, clear_col2 = st.columns([9,1])
+        clear_col1, clear_col2 = st.columns([8,2])
         with clear_col2:
-            if st.button("Clear chat"):
+            if st.button("Clear chat", use_container_width=True):
                 st.session_state.messages = []
                 st.session_state.plots = []
                 st.rerun()
